@@ -19,7 +19,7 @@
 #include <QBuffer>
 #include <QFile>
 #include <QDebug>
-
+#include <QJsonObject>
 
 namespace OCC {
 class BandwidthManager;
@@ -124,6 +124,45 @@ private slots:
 };
 
 /**
+ * @brief The MultipartJob class
+ * @ingroup libsync
+ */
+class MultipartJob : public AbstractNetworkJob {
+    Q_OBJECT
+
+private:
+    QString _errorString;
+    QHttpMultiPart* _multipart;
+public:
+    // Takes ownership of the device
+    explicit MultipartJob(AccountPtr account, const QString& path, QHttpMultiPart* multiPart, QObject* parent = 0)
+        : AbstractNetworkJob(account, path, parent), _multipart(multiPart) {}
+    ~MultipartJob();
+
+    virtual void start() Q_DECL_OVERRIDE;
+
+    virtual bool finished() Q_DECL_OVERRIDE {
+        emit finishedSignal();
+        return true;
+    }
+
+    QString errorString() {
+        return _errorString.isEmpty() ? reply()->errorString() : _errorString;
+    }
+
+    virtual void slotTimeout() Q_DECL_OVERRIDE;
+
+
+signals:
+    void finishedSignal();
+
+private slots:
+#if QT_VERSION < 0x050402
+    void slotSoftAbort();
+#endif
+};
+
+/**
  * @brief This job implements the asynchronous PUT
  *
  * If the server replies to a PUT with a OC-Finish-Poll url, we will query this url until the server
@@ -218,6 +257,40 @@ private slots:
 private:
     void startPollJob(const QString& path);
     void abortWithError(SyncFileItem::Status status, const QString &error);
+};
+
+/**
+ * @brief The PropagateBundle class
+ * @ingroup libsync
+ */
+class PropagateBundle : public PropagateItemJob {
+    Q_OBJECT
+
+private:
+    QVector<AbstractNetworkJob*> _jobs; /// network jobs that are currently in transit
+    QVector<SyncFileItemPtr> _bundledFiles;
+    QJsonObject _bundledFilesMetadata;
+    quint64 _contentID;
+    quint64 chunkSize() const { return _propagator->chunkSize(); }
+
+    bool _finished; // Tells that all the jobs have been finished
+
+public:
+    PropagateBundle(OwncloudPropagator* propagator)
+        : PropagateItemJob(propagator, SyncFileItemPtr(new SyncFileItem)), _contentID(1), _finished(false) {}
+    void start() Q_DECL_OVERRIDE;
+    bool append(const SyncFileItemPtr &bundledFile);
+    QString getRemotePath(QString filePath);
+    bool empty();
+private slots:
+    void abort() Q_DECL_OVERRIDE;
+    void slotMultipartFinished();
+    void finalize(const SyncFileItem&);
+    void slotJobDestroyed(QObject *job);
+    void abortWithError(SyncFileItem::Status status, const QString &error);
+
+private:
+    void itemDone(SyncFileItemPtr item, SyncFileItem::Status status, const QString &errorString);
 };
 
 }

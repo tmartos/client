@@ -62,6 +62,9 @@ QNetworkReply* AccessManager::createRequest(QNetworkAccessManager::Operation op,
         setRawCookie(request.rawHeader("cookie"), request.url());
     }
 
+    //TODO remove
+    setRawCookie("XDEBUG_SESSION=MROW4A;path=/", request.url());
+
     newRequest.setRawHeader(QByteArray("User-Agent"), Utility::userAgentString());
     QByteArray verb = newRequest.attribute(QNetworkRequest::CustomVerbAttribute).toByteArray();
     // For PROPFIND (assumed to be a WebDAV op), set xml/utf8 as content type/encoding

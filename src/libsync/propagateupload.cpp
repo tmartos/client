@@ -28,10 +28,13 @@
 
 #include <json.h>
 #include <QNetworkAccessManager>
+#include <QHttpMultiPart>
+#include <QJsonDocument>
 #include <QFileInfo>
 #include <QDir>
 #include <cmath>
 #include <cstring>
+#include <QXmlStreamReader>
 
 #if QT_VERSION < QT_VERSION_CHECK(5, 4, 2)
 namespace {
@@ -894,5 +897,462 @@ void PropagateUploadFile::abortWithError(SyncFileItem::Status status, const QStr
     done(status, error);
 }
 
+void PropagateBundle::start()
+{
+    QHttpMultiPart *multiPart = new QHttpMultiPart(QHttpMultiPart::RelatedType);
+
+    quint64 contentID = 0;
+    QJsonDocument doc(_bundledFilesMetadata);
+    QByteArray bundledFilesMetadataString(doc.toJson(QJsonDocument::Compact));
+    QHttpPart bundleContentMetadata;
+    bundleContentMetadata.setHeader(QNetworkRequest::ContentLengthHeader, QVariant(bundledFilesMetadataString.size()));
+    bundleContentMetadata.setHeader(QNetworkRequest::ContentTypeHeader, QVariant("application/json; charset=UTF-8"));
+    bundleContentMetadata.setRawHeader("Content-ID", QByteArray::number(contentID));
+    bundleContentMetadata.setBody(bundledFilesMetadataString);
+    multiPart->append(bundleContentMetadata);
+
+    if (_propagator->_abortRequested.fetchAndAddRelaxed(0)) {
+        return;
+    }
+
+    foreach(auto item, _bundledFiles) {
+
+        const QString fullFilePath = _propagator->getFilePath(item->_file);
+
+        if (!FileSystem::fileExists(fullFilePath)) {
+           itemDone(item, SyncFileItem::SoftError, tr("File Removed"));
+        }
+
+        time_t prevModtime = item->_modtime; // the _item value was set in PropagateUploadFileQNAM::start()
+        // but a potential checksum calculation could have taken some time during which the file could
+        // have been changed again, so better check again here.
+
+        item->_modtime = FileSystem::getModTime(fullFilePath);
+        if( prevModtime != item->_modtime ) {
+            _propagator->_anotherSyncNeeded = true;
+            //TODO: create an array of responses for each item
+            //done(SyncFileItem::SoftError, tr("Local file changed during syncing. It will be resumed."));
+            //return;
+        }
+
+        quint64 fileSize = FileSystem::getSize(fullFilePath);
+        item->_size = fileSize;
+
+        // But skip the file if the mtime is too close to 'now'!
+        // That usually indicates a file that is still being changed
+        // or not yet fully copied to the destination.
+        if (fileIsStillChanging(*item)) {
+            _propagator->_anotherSyncNeeded = true;
+            //done(SyncFileItem::SoftError, tr("Local file changed during sync."));
+            //return;
+        }
+
+        QHttpPart bundleContent;
+        bundleContent.setHeader(QNetworkRequest::ContentLengthHeader, QVariant(fileSize));
+        contentID++;
+        bundleContent.setRawHeader("Content-ID", QByteArray::number(contentID));
+        bundleContent.setRawHeader("X-OC-Mtime", QByteArray::number(qint64(item->_modtime)));
+        if(item->_file.contains(".sys.admin#recall#")) {
+            // This is a file recall triggered by the admin.  Note: the
+            // recall list file created by the admin and downloaded by the
+            // client (.sys.admin#recall#) also falls into this category
+            // (albeit users are not supposed to mess up with it)
+
+            // We use a special tag header so that the server may decide to store this file away in some admin stage area
+            // And not directly in the user's area (which would trigger redownloads etc).
+            bundleContent.setRawHeader("OC-Tag", QByteArray(".sys.admin#recall#"));
+        }
+
+        //TODO use Upload debive to support bandwith limitation on the client
+        QFile *file = new QFile(fullFilePath);
+        if (! file->open(QIODevice::ReadOnly)) {
+            qDebug() << "ERR: Could not prepare upload device";
+
+            // If the file is currently locked, we want to retry the sync
+            // when it becomes available again.
+            if (FileSystem::isFileLocked(fullFilePath)) {
+                emit _propagator->seenLockedFile(fullFilePath);
+            }
+
+            // Soft error because this is likely caused by the user modifying his files while syncing
+            //abortWithError( SyncFileItem::SoftError, "ERR: Could not prepare upload device" );
+            delete file;
+            //return;
+        } else {
+            bundleContent.setBodyDevice(file);
+            file->setParent(multiPart);
+            multiPart->append(bundleContent);
+        }
+    }
+
+    _propagator->_activeJobList.append(this);
+
+    const QString userPath = _propagator->account()->davFilesPath();
+
+    // job takes ownership of device via a QScopedPointer. Job deletes itself when finishing
+    MultipartJob* job = new MultipartJob(_propagator->account(), userPath, multiPart);
+
+    //_jobs.append(job);
+    connect(job, SIGNAL(finishedSignal()), this, SLOT(slotMultipartFinished()));
+    connect(job, SIGNAL(destroyed(QObject*)), this, SLOT(slotJobDestroyed(QObject*)));
+    job->start();
+}
+
+//TODO this function is copied over from owncloudpropagator.cpp (not in owncloudpropagato.h)
+/** Updates, creates or removes a blacklist entry for the given item.
+ *
+ * Returns whether the file is in the blacklist now.
+ *
+ */
+static bool blacklistCheck(SyncJournalDb* journal, const SyncFileItem& item)
+{
+    SyncJournalErrorBlacklistRecord oldEntry = journal->errorBlacklistEntry(item._file);
+    SyncJournalErrorBlacklistRecord newEntry = SyncJournalErrorBlacklistRecord::update(oldEntry, item);
+
+    if (newEntry.isValid()) {
+        journal->updateErrorBlacklistEntry(newEntry);
+    } else if (oldEntry.isValid()) {
+        journal->wipeErrorBlacklistEntry(item._file);
+    }
+
+    return newEntry.isValid();
+}
+
+void PropagateBundle::itemDone(SyncFileItemPtr item, SyncFileItem::Status status, const QString &errorString)
+{
+    if (item->_isRestoration) {
+        if( status == SyncFileItem::Success || status == SyncFileItem::Conflict) {
+            status = SyncFileItem::Restoration;
+        } else {
+            item->_errorString += tr("; Restoration Failed: %1").arg(errorString);
+        }
+    } else {
+        if( item->_errorString.isEmpty() ) {
+            item->_errorString = errorString;
+        }
+    }
+
+    if( _propagator->_abortRequested.fetchAndAddRelaxed(0) &&
+            (status == SyncFileItem::NormalError || status == SyncFileItem::FatalError)) {
+        // an abort request is ongoing. Change the status to Soft-Error
+        status = SyncFileItem::SoftError;
+    }
+
+    switch( status ) {
+    case SyncFileItem::SoftError:
+    case SyncFileItem::FatalError:
+        // do not blacklist in case of soft error or fatal error.
+        break;
+    case SyncFileItem::NormalError:
+        if (blacklistCheck(_propagator->_journal, *item) && item->_hasBlacklistEntry) {
+            // do not error if the item was, and continues to be, blacklisted
+            status = SyncFileItem::FileIgnored;
+            item->_errorString.prepend(tr("Continue blacklisting:") + " ");
+        }
+        break;
+    case SyncFileItem::Success:
+    case SyncFileItem::Restoration:
+        if( item->_hasBlacklistEntry ) {
+            // wipe blacklist entry.
+            _propagator->_journal->wipeErrorBlacklistEntry(item->_file);
+            // remove a blacklist entry in case the file was moved.
+            if( item->_originalFile != item->_file ) {
+                _propagator->_journal->wipeErrorBlacklistEntry(item->_originalFile);
+            }
+        }
+        break;
+    case SyncFileItem::Conflict:
+    case SyncFileItem::FileIgnored:
+    case SyncFileItem::NoStatus:
+        // nothing
+        break;
+    }
+
+    item->_status = status;
+
+    emit itemCompleted(*item, *this);
+}
+
+QString PropagateBundle::getRemotePath(QString filePath){
+    return QString((_propagator->_remoteFolder) + filePath);
+}
+
+bool PropagateBundle::append(const SyncFileItemPtr &bundledFile){
+    //TODO: validate here that
+    _bundledFiles.append(bundledFile);
+    QJsonObject fileMetadata;
+    fileMetadata["oc-path"] = getRemotePath(bundledFile->_file);
+    fileMetadata["x-oc-mtime"] = QString::number(qint64(bundledFile->_modtime));
+    _bundledFilesMetadata[QString::number(_contentID)] = fileMetadata;
+    _contentID++;
+    return true;
+}
+
+bool PropagateBundle::empty(){
+    return _bundledFiles.empty();
+}
+
+void PropagateBundle::slotMultipartFinished()
+{
+    MultipartJob *job = qobject_cast<MultipartJob *>(sender());
+    Q_ASSERT(job);
+    slotJobDestroyed(job); // remove it from the _jobs list
+
+    qDebug() << Q_FUNC_INFO << job->reply()->request().url() << "FINISHED WITH STATUS"
+             << job->reply()->error()
+             << (job->reply()->error() == QNetworkReply::NoError ? QLatin1String("") : job->reply()->errorString())
+             << job->reply()->attribute(QNetworkRequest::HttpStatusCodeAttribute)
+             << job->reply()->attribute(QNetworkRequest::HttpReasonPhraseAttribute);
+
+    _propagator->_activeJobList.removeOne(this);
+
+    QNetworkReply::NetworkError err = job->reply()->error();
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 4, 2)
+    bool propertyValid = job->reply()->property(owncloudShouldSoftCancelPropertyName).isValid();
+    if (err == QNetworkReply::OperationCanceledError && job->reply()->property(owncloudShouldSoftCancelPropertyName).isValid()) {
+        // Abort the job and try again later.
+        // This works around a bug in QNAM wich might reuse a non-empty buffer for the next request.
+        qDebug() << "Forcing job abort on HTTP connection reset with Qt < 5.4.2.";
+        _propagator->_anotherSyncNeeded = true;
+        abortWithError(SyncFileItem::SoftError, tr("Forcing job abort on HTTP connection reset with Qt < 5.4.2."));
+        return;
+    }
+#endif
+
+    //TODO might need verifying that it is multistatus?
+    int http_result_code = job->reply()->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+    // Parse DAV response
+    QXmlStreamReader reader(job->reply());
+    reader.addExtraNamespaceDeclaration(QXmlStreamNamespaceDeclaration("d", "DAV:"));
+
+    QString currentHref;
+    QString currentOcPath;
+    QString expectedPath(_propagator->account()->davFilesPath());
+    QMap<QString, QString> item;
+    QMap<QString, QMap<QString, QString> > responseObjectsProperties;
+    bool insidePropstat = false;
+    bool insideProp = false;
+    bool insideMultiStatus = false;
+
+    while (!reader.atEnd()) {
+        QXmlStreamReader::TokenType type = reader.readNext();
+        QString name = reader.name().toString();
+        // Start elements with DAV:
+        if (type == QXmlStreamReader::StartElement && reader.namespaceUri() == QLatin1String("DAV:")) {
+            if (name == QLatin1String("href")) {
+                // We don't use URL encoding in our request URL (which is the expected path) (QNAM will do it for us)
+                // but the result will have URL encoding..
+                QString hrefString = QString::fromUtf8(QByteArray::fromPercentEncoding(reader.readElementText().toUtf8()));
+                if (!hrefString.endsWith(expectedPath)) {
+                    qDebug() << "Invalid href" << hrefString << "expected starting with" << expectedPath;
+                }
+                currentHref = hrefString;
+            }
+            else if (name == QLatin1String("response")) {
+                continue;
+            }
+            else if (name == QLatin1String("propstat")) {
+                insidePropstat = true;
+            }
+            else if (name == QLatin1String("status") && insidePropstat) {
+                QString httpStatus = reader.readElementText();
+                item.insert(name, httpStatus);
+//                if (httpStatus.startsWith("HTTP/1.1 200")) {
+//                    currentPropsHaveHttp200 = true;
+//                } else {
+//                    currentPropsHaveHttp200 = false;
+//                }
+            } else if (name == QLatin1String("prop")) {
+                insideProp = true;
+                continue;
+            } else if (name == QLatin1String("multistatus")) {
+                insideMultiStatus = true;
+                continue;
+            }
+        }
+
+        if (type == QXmlStreamReader::StartElement && insidePropstat && insideProp) {
+            if (name == QLatin1String("oc-path")){
+                currentOcPath = reader.readElementText(QXmlStreamReader::SkipChildElements);
+            }
+            else{
+                item.insert(name, reader.readElementText(QXmlStreamReader::SkipChildElements));
+            }
+        }
+
+        // End elements with DAV:
+        if (type == QXmlStreamReader::EndElement) {
+            if (reader.namespaceUri() == QLatin1String("DAV:")) {
+                if (reader.name() == "response") {
+                    currentHref.clear();
+                } else if (reader.name() == "propstat") {
+                    insidePropstat = false;
+                    if (!currentOcPath.isEmpty()){
+                        responseObjectsProperties.insert(currentOcPath, QMap<QString,QString>(item));
+                    }
+                    currentOcPath.clear();
+                    item.clear();
+                } else if (reader.name() == "prop") {
+                    insideProp = false;
+                }
+            }
+        }
+    }
+
+    if (reader.hasError()) {
+        // XML Parser error? Whatever had been emitted before will come as directoryListingIterated
+        qDebug() << "ERROR" << reader.errorString();
+    }
+
+    foreach(auto item, _bundledFiles) {
+        QString itemFilePath(getRemotePath(item->_file));
+        if (responseObjectsProperties.contains(itemFilePath)){
+            QMap<QString, QString> fileProperties = responseObjectsProperties.value(itemFilePath);
+
+            //verify if it has all required properties
+            if (fileProperties.contains("status") && (fileProperties.value("status")).startsWith("HTTP/1.1 200")){
+                // Check if the file still exists
+                const QString fullFilePath(_propagator->getFilePath(item->_file));
+                if( !FileSystem::fileExists(fullFilePath) ) {
+                    //abortWithError(SyncFileItem::SoftError, tr("The local file was removed during sync."));
+                }
+
+                if (! FileSystem::verifyFileUnchanged(fullFilePath, item->_size, item->_modtime)) {
+                    _propagator->_anotherSyncNeeded = true;
+                }
+
+                //OC-FileID section
+                if (fileProperties.contains("oc-fileid")){
+                    QString fid = fileProperties.value("oc-fileid");
+                    if( !item->_fileId.isEmpty() && item->_fileId != fid ) {
+                        qDebug() << "WARN: File ID changed!" << item->_fileId << fid;
+                    }
+                    item->_fileId =fid.toStdString().c_str();
+                }
+
+                //OC-ETag section
+                QByteArray ocEtag = parseEtag(fileProperties.value("oc-etag").toStdString().c_str());
+                QByteArray etag = parseEtag(fileProperties.value("etag").toStdString().c_str());
+                item->_etag = ocEtag.isEmpty() ? etag : ocEtag;
+                if (ocEtag.length() > 0 && ocEtag != etag) {
+                    qDebug() << "Quite peculiar, we have an etag != OC-Etag [no problem!]" << etag << ocEtag;
+                }
+
+                item->_responseTimeStamp = job->responseTimestamp();
+
+                if (fileProperties.value("x-oc-mtime") != "accepted"){
+                    // X-OC-MTime is supported since owncloud 5.0.   But not when chunking.
+                    // Normally Owncloud 6 always puts X-OC-MTime
+                    qWarning() << "Server does not support X-OC-MTime" << job->reply()->rawHeader("X-OC-MTime");
+                    // Well, the mtime was not set
+
+                    //done(SyncFileItem::SoftError, "Server does not support X-OC-MTime");
+                    //TODO error for item
+                }
+
+                // performance logging
+                //item->_requestDuration = _stopWatch.stop();
+                //qDebug() << "*==* duration UPLOAD" << item->_size
+                //         << item->_requestDuration;
+                // The job might stay alive for the whole sync, release this tiny bit of memory.
+                //_stopWatch.reset();
+            }
+            else{
+                //TODO there is an error for that file
+            }
+        } else{
+            //TODO ERROR, it means response did not return any status for the file!!
+            continue;
+        }
+
+        if (!_propagator->_journal->setFileRecord(SyncJournalFileRecord(*item, _propagator->getFilePath(item->_file)))) {
+            done(SyncFileItem::FatalError, tr("Error writing metadata to the database"));
+            //return;
+        }
+        // Remove from the progress database:
+        _propagator->_journal->setUploadInfo(item->_file, SyncJournalDb::UploadInfo());
+        _propagator->_journal->commit("upload file start");
+    }
+
+    finalize(*_item);
+}
+
+void PropagateBundle::finalize(const SyncFileItem &copy)
+{
+    //TODO
+    done(SyncFileItem::Success);
+}
+
+void PropagateBundle::slotJobDestroyed(QObject* job)
+{
+    _jobs.erase(std::remove(_jobs.begin(), _jobs.end(), job) , _jobs.end());
+}
+
+void PropagateBundle::abort()
+{
+    foreach(auto *job, _jobs) {
+        if (job->reply()) {
+            qDebug() << Q_FUNC_INFO << job << this->_item->_file;
+            job->reply()->abort();
+        }
+    }
+}
+
+// This function is used whenever there is an error occuring and jobs might be in progress
+void PropagateBundle::abortWithError(SyncFileItem::Status status, const QString &error)
+{
+    _finished = true;
+    abort();
+    done(status, error);
+}
+
+MultipartJob::~MultipartJob()
+{
+    // Make sure that we destroy the QNetworkReply before our _device of which it keeps an internal pointer.
+    setReply(0);
+}
+
+void MultipartJob::start() {
+    QNetworkRequest req;
+    setReply(multipartRequest(path(), req, _multipart));
+    setupConnections(reply());
+
+    if( reply()->error() != QNetworkReply::NoError ) {
+        qWarning() << Q_FUNC_INFO << " Network error: " << reply()->errorString();
+    }
+
+//    connect(reply(), SIGNAL(uploadProgress(qint64,qint64)), this, SIGNAL(uploadProgress(qint64,qint64)));
+    connect(this, SIGNAL(networkActivity()), account().data(), SIGNAL(propagatorNetworkActivity()));
+
+//    // For Qt versions not including https://codereview.qt-project.org/110150
+//    // Also do the runtime check if compiled with an old Qt but running with fixed one.
+//    // (workaround disabled on windows and mac because the binaries we ship have patched qt)
+//#if QT_VERSION < QT_VERSION_CHECK(4, 8, 7)
+//    if (QLatin1String(qVersion()) < QLatin1String("4.8.7"))
+//        connect(_device.data(), SIGNAL(wasReset()), this, SLOT(slotSoftAbort()));
+//#elif QT_VERSION > QT_VERSION_CHECK(5, 0, 0) && QT_VERSION < QT_VERSION_CHECK(5, 4, 2) && !defined Q_OS_WIN && !defined Q_OS_MAC
+//    if (QLatin1String(qVersion()) < QLatin1String("5.4.2"))
+//        connect(_device.data(), SIGNAL(wasReset()), this, SLOT(slotSoftAbort()));
+//#endif
+
+    AbstractNetworkJob::start();
+}
+
+void MultipartJob::slotTimeout() {
+    qDebug() << "Timeout" << (reply() ? reply()->request().url() : path());
+    if (!reply())
+        return;
+    _errorString =  tr("Connection Timeout");
+    reply()->abort();
+}
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 4, 2)
+void MultipartJob::slotSoftAbort() {
+    reply()->setProperty(owncloudShouldSoftCancelPropertyName, true);
+    reply()->abort();
+}
+#endif
 
 }
