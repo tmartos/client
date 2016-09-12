@@ -69,7 +69,13 @@ struct CmdOptions {
 // So we have to use a global variable
 CmdOptions *opts = 0;
 
+<<<<<<< HEAD
 const qint64 timeoutToUseMsec = qMax(1000, ConnectionValidator::DefaultCallingIntervalMsec - 5*1000);
+=======
+// Make sure the timeout for this job is less than how often we get called
+// This makes sure we get tried often enough without "ConnectionValidator already running"
+static qint64 timeoutToUseMsec = qMax(1000, ConnectionValidator::DefaultCallingIntervalMsec - 5*1000);
+>>>>>>> add server capabilities to owncloudcmd
 
 class EchoDisabler
 {
@@ -391,7 +397,10 @@ int main(int argc, char **argv) {
     account->setCredentials(cred);
     account->setSslErrorHandler(sslErrorHandler);
 
+<<<<<<< HEAD
 #if QT_VERSION >= QT_VERSION_CHECK(5, 0, 0)
+=======
+>>>>>>> add server capabilities to owncloudcmd
     //obtain capabilities using event loop
     QEventLoop loop;
 
@@ -406,7 +415,11 @@ int main(int argc, char **argv) {
     job->start();
 
     loop.exec();
+<<<<<<< HEAD
 #endif
+=======
+
+>>>>>>> add server capabilities to owncloudcmd
 
     // much lower age than the default since this utility is usually made to be run right after a change in the tests
     SyncEngine::minimumFileAgeForUpload = 0;
